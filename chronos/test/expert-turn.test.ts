@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -21,6 +21,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createExpertRegistry } from "../tools/expert-registry.js";
 import { restoreExpertSessions, runExpertTurn, type ExpertTurnInput } from "../tools/expert-turn.js";
 import { createSourceContext } from "../tools/source-context.js";
+import { createTaskBatchTool } from "../tools/task-batch.js";
+import { createTaskTool } from "../tools/view-page.js";
 import { loadExpertTasks } from "../utils/expert-store.js";
 
 const model: Model<"openai-completions"> = {
@@ -51,7 +53,7 @@ function fixture(t: TestContext, script: ScriptedReply[], api: Api = model.api) 
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   writeFileSync(join(cwd, "fixture.txt"), "fixture contents");
   const requests: Request[] = [];
-  const testModel = { ...model, api };
+  const testModel = { ...model, api, input: [...model.input] };
   const previous = getApiProvider(api);
   const stream = (_model: Model<Api>, context: Context, options?: ProviderStreamOptions) => {
     assert.ok(requests.length < 12, "Expert loop did not terminate");
@@ -116,7 +118,7 @@ test("normal answers and under-budget tools preserve the conversation", async (t
   assert.ok(f.requests.every((r) => r.options?.toolChoice === undefined));
 });
 
-test("budget exhaustion retains definitions and serializes tools with tool_choice none", async (t) => {
+test("budget exhaustion retains definitions in the actual OpenAI payload", async (t) => {
   const f = fixture(t, [...Array.from({ length: 8 }, (_, i) => calls(1, i)), answer()]);
   const result = await f.run();
   assert.ok(result.ok);
@@ -124,14 +126,14 @@ test("budget exhaustion retains definitions and serializes tools with tool_choic
   assert.equal(result.toolUses.length, 8);
   for (const request of f.requests) assert.deepEqual(request.context.tools, f.requests[0].context.tools);
   const last = f.requests.at(-1)!;
-  assert.equal(last.options?.toolChoice, "none");
+  assert.equal(last.options?.toolChoice, undefined);
   assert.match(last.context.systemPrompt!, /budget.*exhausted/i);
   assertPaired(last.context.messages);
 
   // Inspect the real, unpatched pi-ai serializer without making a network call.
   let payload: Record<string, unknown> | undefined;
   const serialized = await streamOpenAICompletions(model, last.context, {
-    apiKey: "test-key", toolChoice: "none",
+    ...last.options,
     onPayload(value) {
       payload = value as Record<string, unknown>;
       throw new Error("Captured before network");
@@ -139,7 +141,7 @@ test("budget exhaustion retains definitions and serializes tools with tool_choic
   }).result();
   assert.match(serialized.errorMessage!, /Captured before network/);
   assert.ok(Array.isArray(payload?.tools) && payload.tools.length > 0);
-  assert.equal(payload.tool_choice, "none");
+  assert.equal(payload.tool_choice, undefined);
 });
 
 test("oversized batches execute only eight calls and pair rejected calls", async (t) => {
@@ -220,5 +222,136 @@ test("provider-reported abortion does not commit a turn", async (t) => {
   const f = fixture(t, [reply([], "aborted")]);
   assert.equal((await f.run()).ok, false);
   assert.deepEqual(f.history(), []);
+  assert.deepEqual(f.stored(), []);
+});
+
+const emptyResponses: [string, AssistantMessage["content"]][] = [
+  ["empty", []],
+  ["whitespace-only", [{ type: "text", text: " \n\t" }]],
+  ["thinking-only", [{ type: "thinking", thinking: "Still considering the answer." }]],
+];
+
+for (const [label, content] of emptyResponses) {
+  test(`${label} replies recover without entering conversation history`, async (t) => {
+    const f = fixture(t, [reply(content), answer()]);
+    const result = await f.run();
+    assert.ok(result.ok);
+    assert.equal(result.text, "DONE");
+    assert.equal(f.requests.length, 2);
+    assert.deepEqual(f.requests[1].context.messages, f.requests[0].context.messages);
+    assert.match(f.requests[1].context.systemPrompt!, /answer.*text/i);
+    assert.equal(f.history().length, 2);
+    assert.equal(f.stored()[0].turns[0].steps, undefined);
+    assert.deepEqual(f.stored()[0].turns[0].response, answer());
+  });
+}
+
+test("two empty-reply retries are allowed and all completion costs are counted", async (t) => {
+  const f = fixture(t, [reply([], "stop", 0.25), reply(emptyResponses[2][1], "stop", 0.5), reply([{ type: "text", text: "DONE" }], "stop", 1)]);
+  const result = await f.run();
+  assert.ok(result.ok);
+  assert.equal(result.text, "DONE");
+  assert.equal(result.cost, 1.75);
+  assert.equal(f.requests.length, 3);
+});
+
+test("repeated empty replies fail without modifying prior history or persistence", async (t) => {
+  const f = fixture(t, [answer("FIRST"), reply([]), reply([]), reply([])]);
+  await f.run();
+  const history = structuredClone(f.history());
+  const stored = f.stored();
+  const result = await f.run({ taskId: "task-1" });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.error, /no answer text/i);
+  assert.equal(f.requests.length, 4);
+  assert.deepEqual(f.history(), history);
+  assert.deepEqual(f.stored(), stored);
+});
+
+test("empty replies and post-budget tool requests share one retry allowance", async (t) => {
+  const f = fixture(t, [reply([]), calls(8), calls(1, 8), reply([])]);
+  const result = await f.run();
+  assert.equal(result.ok, false);
+  assert.equal(f.requests.length, 4);
+  assert.deepEqual(f.history(), []);
+  assert.deepEqual(f.stored(), []);
+  for (const request of f.requests) assertPaired(request.context.messages);
+});
+
+test("an empty reply after budget exhaustion can recover and be followed up", async (t) => {
+  const f = fixture(t, [calls(8), calls(1, 8), reply(emptyResponses[2][1]), answer(), answer("FOLLOW-UP")]);
+  const result = await f.run();
+  assert.ok(result.ok);
+  assert.equal(result.text, "DONE");
+  assert.equal(f.requests.length, 4);
+  assert.equal(f.requests[3].options?.toolChoice, undefined);
+  assert.deepEqual(f.requests[3].context.messages, f.requests[2].context.messages);
+  assertPaired(f.history());
+  const restored = createExpertRegistry();
+  await restoreExpertSessions(restored, f.extCtx, f.stored());
+  assertPaired(restored.sessions.get(result.taskId)!.messages);
+  const followUp = await runExpertTurn(restored, f.sourceCtx, "Expert instructions.", f.extCtx, { taskId: result.taskId, prompt: "Continue." });
+  assert.ok(followUp.ok);
+  assert.equal(followUp.text, "FOLLOW-UP");
+  assert.equal(f.requests.at(-1)!.context.systemPrompt, "Expert instructions.");
+});
+
+test("normal tool selection can finish after a rejected call without executing it", async (t) => {
+  let straySent = false;
+  const finalize = ({ options }: Request) => {
+    // Observed on Qwen: forcing none can yield only a progress message.
+    if (options?.toolChoice === "none") return answer("Call 9 of 10.");
+    if (!straySent) {
+      straySent = true;
+      return calls(1, 8);
+    }
+    return answer();
+  };
+  const f = fixture(t, [calls(8), finalize, finalize]);
+  const result = await f.run();
+  assert.ok(result.ok);
+  assert.equal(result.text, "DONE");
+  assert.equal(result.toolUses.filter((use) => !use.isError).length, 8);
+  assert.equal(result.toolUses.filter((use) => use.isError).length, 1);
+  assert.equal(f.requests[1].options?.toolChoice, undefined);
+  assert.equal(f.requests.length, 3);
+  for (const request of f.requests) assert.deepEqual(request.context.tools, f.requests[0].context.tools);
+  assertPaired(f.history());
+});
+
+test("cancellation during empty-reply recovery does not commit partial text", async (t) => {
+  const controller = new AbortController();
+  const f = fixture(t, [reply([]), () => { controller.abort(); return answer("PARTIAL"); }]);
+  assert.equal((await f.run({ signal: controller.signal })).ok, false);
+  assert.equal(f.requests.length, 2);
+  assert.deepEqual(f.history(), []);
+  assert.deepEqual(f.stored(), []);
+});
+
+test("task does not overwrite an output file when empty-reply recovery fails", async (t) => {
+  const f = fixture(t, [reply([]), reply([]), reply([])]);
+  f.sourceCtx.sourceDataDir = f.cwd;
+  writeFileSync(join(f.cwd, "answer.txt"), "previous answer");
+  const task = createTaskTool(f.sourceCtx, f.registry, "Task", "Expert instructions.");
+  const result = await task.execute("task-call", { prompt: "Answer.", output_file: "answer.txt" }, undefined, undefined, f.extCtx);
+  assert.match(result.content.filter((c) => c.type === "text").map((c) => c.text).join(""), /no answer text/i);
+  assert.equal(readFileSync(join(f.cwd, "answer.txt"), "utf8"), "previous answer");
+  assert.deepEqual(f.stored(), []);
+});
+
+test("task_batch reports failure and does not create an empty output file", async (t) => {
+  const f = fixture(t, [reply([]), reply([]), reply([])]);
+  f.extCtx.model!.input.push("image");
+  f.sourceCtx.sourceDir = f.cwd;
+  f.sourceCtx.sourceDataDir = f.cwd;
+  mkdirSync(join(f.cwd, "png"));
+  writeFileSync(join(f.cwd, "png", "page_0001.png"), Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64",
+  ));
+  const task = createTaskBatchTool(f.sourceCtx, f.registry, { description: "Batch", promptGuidelines: [] }, "Expert instructions.");
+  const result = await task.execute("batch-call", { page_ids: [1], prompt: "Answer.", output_file: "answer_{page_id}.txt" }, undefined, undefined, f.extCtx);
+  assert.match(result.content.filter((c) => c.type === "text").map((c) => c.text).join(""), /no answer text/i);
+  assert.equal(f.requests.length, 3);
+  assert.equal(existsSync(join(f.cwd, "answer_0001.txt")), false);
   assert.deepEqual(f.stored(), []);
 });

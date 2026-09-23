@@ -211,6 +211,7 @@ export async function runExpertTurn(
     granted: [...granted],
   });
   let recoveryRetries = 0;
+  let needsAnswerText = false;
   let totalCost = 0;
   let finalResponse;
 
@@ -219,19 +220,19 @@ export async function runExpertTurn(
       return { ok: false, taskId, error: "Expert turn aborted." };
     }
     const budgetExhausted = toolCallCount >= MAX_EXPERT_TOOL_CALLS;
+    let systemPrompt = pageExpertPrompt;
+    if (budgetExhausted) systemPrompt += `\n\n${TOOL_BUDGET_EXHAUSTED}`;
+    if (needsAnswerText) systemPrompt += "\n\nProvide your final answer as visible text, not just internal reasoning.";
     const response = await complete(
       resolved.model,
       {
-        systemPrompt: budgetExhausted ? `${pageExpertPrompt}\n\n${TOOL_BUDGET_EXHAUSTED}` : pageExpertPrompt,
+        systemPrompt,
         messages: [...session.messages, ...turnMessages],
         // Keep definitions with tool history: dropping them makes pi-ai send
         // tools: [], which some OpenAI-compatible servers reject (issue #17).
         tools: expertToolDefs,
       },
-      {
-        apiKey: resolved.apiKey, headers: resolved.headers, signal: input.signal,
-        ...(budgetExhausted && resolved.model.api === "openai-completions" ? { toolChoice: "none" } : {}),
-      },
+      { apiKey: resolved.apiKey, headers: resolved.headers, signal: input.signal },
     );
     if (response.stopReason === "error") {
       return {
@@ -247,11 +248,21 @@ export async function runExpertTurn(
     if (input.signal?.aborted || response.stopReason === "aborted") {
       return { ok: false, taskId, error: "Expert turn aborted." };
     }
-    turnMessages.push(response);
-    finalResponse = response;
     totalCost += response.usage?.cost?.total ?? 0;
 
     const toolCalls = response.content.filter(isToolCall);
+    const hasText = response.content.some((c) => c.type === "text" && c.text.trim().length > 0);
+    if (toolCalls.length === 0 && !hasText) {
+      if (recoveryRetries++ >= MAX_EXPERT_RECOVERY_RETRIES) {
+        return { ok: false, taskId, error: "Expert returned no answer text after recovery retries." };
+      }
+      // Retry from the last useful exchange. Empty/thinking-only replies need
+      // not enter either live or persisted history; their cost still counts.
+      needsAnswerText = true;
+      continue;
+    }
+    turnMessages.push(response);
+    finalResponse = response;
     if (toolCalls.length === 0) break;
 
     // Intermediate assistant turn — record it, then run each requested tool.
